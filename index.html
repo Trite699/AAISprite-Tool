@@ -92,11 +92,13 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     <label>Cells<select class="sel" id="cs"></select></label>
     <label>Animation<select class="sel" id="as"></select></label>
     <label>Screen map (NSCR)<select class="sel" id="ns"></select></label>
-    <label>Raw graphics depth<select class="sel" id="rb"><option value="4">4bpp</option><option value="8">8bpp</option></select></label>
+    <label>Raw graphics depth<select class="sel" id="rb"><option value="auto" selected>Auto (from palette)</option><option value="4">4bpp</option><option value="8">8bpp</option></select></label>
     <label>Raw layout<select class="sel" id="rl"><option value="auto" selected>Auto (best guess)</option><option value="0">Tiled 8×8</option><option value="1">Scanned (bitmap)</option></select></label>
     <label>Tiles per row (tiled)<select class="sel" id="tw"><option>4</option><option>8</option><option>16</option><option selected>32</option><option>64</option></select></label>
     <label>Scanned gfx width<select class="sel" id="sw"><option>512</option><option>256</option><option selected>128</option><option>64</option><option>32</option></select></label>
     <label class="chk"><input type="checkbox" id="allf"> List every file</label>
+    <label class="chk"><input type="checkbox" id="grp" checked> Auto-group frames (images after one palette)</label>
+    <label>Frame delay<select class="sel" id="fd"><option value="3">3 ticks</option><option value="6" selected>6 ticks</option><option value="12">12 ticks</option><option value="30">30 ticks</option></select></label>
   </div>
   <div class="opts" style="margin-top:0">
     <label>Zoom<select class="sel" id="zoom"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>6</option></select></label>
@@ -329,9 +331,9 @@ function guessRaw(d,bpp){ // pick scanned width vs tiled by how similar neighbou
   return best;
 }
 function parseGfx(d){
-  if(str(d,0,4)!=='RGCN'){const bpp=+$('rb').value;let lin=$('rl').value==='1';
-    if($('rl').value==='auto'){const g=guessRaw(d,bpp);lin=g.lin;if(g.lin)$('sw').value=g.w;}
-    return{bpp,data:d,tw:0,th:0,lin,tb:bpp===4?32:64};}
+  if(str(d,0,4)!=='RGCN'){const bpp=$('rb').value==='auto'?(S.pal&&S.pal.cols.length>=256?8:4):+$('rb').value;let lin=$('rl').value==='1',w=+$('sw').value;
+    if($('rl').value==='auto'){const g=guessRaw(d,bpp);lin=g.lin;if(g.lin)w=g.w;}
+    return{bpp,data:d,tw:0,th:0,lin,w,tb:bpp===4?32:64};}
   const{dv,m}=blocks(d),p=m.RAHC;if(p===undefined)throw new Error('Not a graphics file');
   const bpp=dv.getUint32(p+0xc,true)===4?8:4,sz=Math.min(dv.getUint32(p+0x18,true),d.length-p-0x20);
   return{bpp,data:d.subarray(p+0x20,p+0x20+sz),tw:dv.getUint16(p+0xa,true),th:dv.getUint16(p+8,true),lin:dv.getUint32(p+0x14,true)===1,tb:bpp===4?32:64};
@@ -437,6 +439,15 @@ function loadSprite(resetBank){
     S.pal=pe?parsePal(getData(S.c,pe)):null;S.gfx=ge?parseGfx(getData(S.c,ge)):null;
     S.cells=ce?parseCells(getData(S.c,ce)):null;S.anim=ae?parseAnim(getData(S.c,ae)):null;S.scr=ent('ns')?parseScr(getData(S.c,ent('ns'))):null;
     if(!S.pal||!S.gfx)throw new Error('Pick a palette and a graphics file above — or in the ROM browser select a file and click “Use as Palette / Graphics / Cells / Animation”.');
+    S.gseq=null;S.gstart=0;
+    if(S.gfx&&!S.cells&&!S.scr&&$('grp').checked&&str(getData(S.c,ge),0,4)!=='RGCN'){
+      // AAI1: a palette is followed by the images that use it — treat them as animation frames
+      const c=S.c,gi=+$('gs').value,isP=t=>t==='PAL4'||t==='PAL8'||t==='NCLR';let p0=-1;
+      for(let k=gi;k>=0;k--)if(isP(tagOf(c,c.ents[k]).tag)){p0=k;break;}
+      const seq=[];
+      for(let k=p0+1;k<c.ents.length;k++){const t=tagOf(c,c.ents[k]).tag;if(isP(t))break;if(t==='IMG')seq.push(k);}
+      if(seq.length>1&&seq.includes(gi)){S.gseq=seq.map(k=>parseGfx(getData(c,c.ents[k])));S.gstart=seq.indexOf(gi);}
+    }
     const nb=Math.max(1,Math.ceil(S.pal.cols.length/16));
     sel('pb','<option value="-1">Auto (per OAM)</option>'+Array.from({length:nb},(_,i)=>`<option value="${i}">Bank ${i}</option>`).join(''));
     S.bank=-1;S.fc.clear();
@@ -454,20 +465,21 @@ function buildAnimSel(){
 }
 function buildList(seq){
   S.fc.clear();S.fi=0;S.acc=0;
-  if(!S.cells)S.list=[{cell:S.scr?-2:-1,dur:60}];
+  if(!S.cells)S.list=S.gseq?S.gseq.map((_,k)=>({cell:-1,gi:k,dur:+$('fd').value})):[{cell:S.scr?-2:-1,dur:60}];
   else if(S.anim)S.list=(S.anim.seqs[seq]||[]).map(f=>({...f,cell:Math.min(f.cell,S.cells.cells.length-1)}));
   else S.list=S.cells.cells.map((_,i)=>({cell:i,dur:30}));
   if(!S.list.length)S.list=[{cell:0,dur:30}];
+  if(S.gseq)S.fi=S.gstart||0;
   $('scrub').max=S.list.length-1;
   const tot=S.list.reduce((a,e)=>a+e.dur,0);
   $('tinfo').textContent=S.cells?`${S.list.length} frames · ${(tot/60).toFixed(2)} s · ${S.cells.cells.length} cells`:`tile sheet · ${S.gfx.data.length/S.gfx.tb|0} tiles`;
   showFrame();
 }
 function color(a){const b=S.bank>=0?S.bank:a;return S.pal.cols;}
-function frameCanvas(cell){
-  const key=cell+':'+S.bank;if(S.fc.has(key))return S.fc.get(key);
-  const g=S.gfx,cols=S.pal.cols;let c;
-  if(cell===-2){c=drawScr();}else if(cell<0&&g.lin){c=linSheet();}else if(cell<0){ // tile sheet
+function frameCanvas(cell,gi){
+  const key=cell+':'+S.bank+':'+(gi??'');if(S.fc.has(key))return S.fc.get(key);
+  const g=gi!=null?S.gseq[gi]:S.gfx,cols=S.pal.cols;let c;
+  if(cell===-2){c=drawScr();}else if(cell<0&&g.lin){c=linSheet(g);}else if(cell<0){ // tile sheet
     const W=Math.max(1,+$('tw').value||32),n=Math.max(1,g.data.length/g.tb|0),H=Math.ceil(n/W);
     c=document.createElement('canvas');c.width=W*8;c.height=H*8;
     const ctx=c.getContext('2d'),im=ctx.createImageData(c.width,c.height),bk=Math.max(S.bank,0);
@@ -499,7 +511,7 @@ function tf(e){
   return{tx:e.tx,ty:e.ty,rot:e.rot,sx:e.sx,sy:e.sy,id:!e.tx&&!e.ty&&!e.rot&&e.sx===1&&e.sy===1};
 }
 function frameImg(e){
-  const t=tf(e),base=frameCanvas(e.cell);
+  const t=tf(e),base=frameCanvas(e.cell,e.gi);
   if(t.id||e.cell<0)return base;
   const key='t'+e.cell+':'+S.bank+':'+[t.tx,t.ty,t.rot,t.sx,t.sy].join(',');
   if(S.fc.has(key))return S.fc.get(key);
@@ -509,12 +521,12 @@ function frameImg(e){
 }
 function lw(){return +$('sw').value;}
 function pxl(g,x,y){ // scanned (non-tiled) graphics, lw() pixels wide
-  const W=lw(),i=y*W+x;
+  const W=g.w||lw(),i=y*W+x;
   if(g.bpp===8)return g.data[i]||0;
   const b=g.data[i>>1];return b===undefined?0:(i&1?b>>4:b&15);
 }
-function linSheet(){
-  const g=S.gfx,W=lw(),H=Math.max(1,Math.ceil(g.data.length*(g.bpp===8?1:2)/W)),c=document.createElement('canvas');c.width=W;c.height=H;
+function linSheet(g){
+  g=g||S.gfx;const W=g.w||lw(),H=Math.max(1,Math.ceil(g.data.length*(g.bpp===8?1:2)/W)),c=document.createElement('canvas');c.width=W;c.height=H;
   const ctx=c.getContext('2d'),im=ctx.createImageData(W,H),bk=Math.max(S.bank,0);
   for(let y=0;y<H;y++)for(let x=0;x<W;x++){
     const v=pxl(g,x,y);if(!v)continue;const col=S.pal.cols[g.bpp===4?bk*16+v:v]||[255,0,255],p=(y*W+x)*4;
@@ -527,7 +539,7 @@ function px(g,o,y,x){ // pixel value inside a tile at byte offset o
   const b=g.data[o+y*8+x];return b===undefined?0:b;
 }
 function bounds(){
-  if(!S.cells){const f=frameCanvas(S.list[0].cell);return{x:0,y:0,w:f.width,h:f.height};}
+  if(!S.cells){let w=1,h=1;for(const e of S.list){const f=frameCanvas(e.cell,e.gi);w=Math.max(w,f.width);h=Math.max(h,f.height);}return{x:0,y:0,w,h};}
   let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
   for(const e of S.list){const t=tf(e),cs=Math.cos(t.rot),sn=Math.sin(t.rot);
     for(const o of S.cells.cells[e.cell]||[])for(const[a_,b_]of[[o.x,o.y],[o.x+o.w,o.y],[o.x,o.y+o.h],[o.x+o.w,o.y+o.h]]){
@@ -677,6 +689,8 @@ $('hp').onclick=()=>{hexOff=Math.max(0,hexOff-512);drawHex();};
 $('hn').onclick=()=>{if(hexData&&hexOff+512<hexData.length){hexOff+=512;drawHex();}};
 ['ps','gs','cs','as','ns'].forEach(id=>$(id).onchange=()=>loadSprite());
 $('rb').onchange=()=>{if(S.c)loadSprite();};
+$('grp').onchange=()=>{if(S.c)loadSprite();};
+$('fd').onchange=()=>{if(S.gseq)buildList(0);};
 $('sw').onchange=()=>{S.fc.clear();if(S.gfx)showFrame();};
 ['rl','tw'].forEach(id=>$(id).onchange=()=>{if(S.c)loadSprite();});
 $('allf').onchange=()=>{if(S.c){fillSel(S.c,true);loadSprite();}};
