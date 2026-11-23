@@ -100,6 +100,10 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     <label class="chk"><input type="checkbox" id="ap" checked> Auto-pick palette</label>
     <label class="chk"><input type="checkbox" id="grp" checked> Auto-group frames (3+ consecutive same-size images)</label>
     <label>Frame delay<select class="sel" id="fd"><option value="3">3 ticks</option><option value="6" selected>6 ticks</option><option value="12">12 ticks</option><option value="30">30 ticks</option></select></label>
+    <label class="chk"><input type="checkbox" id="sl" checked> Slice sprite sheet into frames</label>
+    <label class="chk"><input type="checkbox" id="al" checked> Align frames (bottom-centre)</label>
+    <label>Frame shift X<input class="inp" type="number" id="sx" value="0" style="width:72px"></label>
+    <label>Frame shift Y<input class="inp" type="number" id="sy" value="0" style="width:72px"></label>
   </div>
   <div class="opts" style="margin-top:0">
     <label>Zoom<select class="sel" id="zoom"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>6</option></select></label>
@@ -483,6 +487,8 @@ function loadSprite(resetBank){
       const seq=[];for(let k=a;k<=z2;k++)seq.push(k);
       if(sz>=2048&&seq.length>=3){S.gseq=seq.map(k=>parseGfx(getData(c,c.ents[k])));S.gstart=seq.indexOf(gi);}
     }
+    S.crops=null;
+    if(S.gfx&&!S.cells&&!S.scr&&!S.gseq&&S.gfx.lin&&$('sl').checked)S.crops=sliceSheet(S.gfx);
     const nb=Math.max(1,Math.ceil(S.pal.cols.length/16));
     sel('pb','<option value="-1">Auto (per OAM)</option>'+Array.from({length:nb},(_,i)=>`<option value="${i}">Bank ${i}</option>`).join(''));
     S.bank=-1;if(autoBank!==null&&autoBank>=0){$('pb').value=autoBank;S.bank=autoBank;}S.fc.clear();
@@ -500,7 +506,7 @@ function buildAnimSel(){
 }
 function buildList(seq){
   S.fc.clear();S.fi=0;S.acc=0;
-  if(!S.cells)S.list=S.gseq?S.gseq.map((_,k)=>({cell:-1,gi:k,dur:+$('fd').value})):[{cell:S.scr?-2:-1,dur:60}];
+  if(!S.cells)S.list=S.gseq?S.gseq.map((_,k)=>({cell:-1,gi:k,dur:+$('fd').value})):S.crops?S.crops.map(c=>({cell:-1,crop:c,dur:+$('fd').value,dx:0,dy:0})):[{cell:S.scr?-2:-1,dur:60}];
   else if(S.anim)S.list=(S.anim.seqs[seq]||[]).map(f=>({...f,cell:Math.min(f.cell,S.cells.cells.length-1)}));
   else S.list=S.cells.cells.map((_,i)=>({cell:i,dur:30}));
   if(!S.list.length)S.list=[{cell:0,dur:30}];
@@ -546,6 +552,7 @@ function tf(e){
   return{tx:e.tx,ty:e.ty,rot:e.rot,sx:e.sx,sy:e.sy,id:!e.tx&&!e.ty&&!e.rot&&e.sx===1&&e.sy===1};
 }
 function frameImg(e){
+  if(e.crop)return cropImg(e);
   const t=tf(e),base=frameCanvas(e.cell,e.gi);
   if(t.id||e.cell<0)return base;
   const key='t'+e.cell+':'+S.bank+':'+[t.tx,t.ty,t.rot,t.sx,t.sy].join(',');
@@ -555,6 +562,26 @@ function frameImg(e){
   S.fc.set(key,c);return c;
 }
 function lw(){return +$('sw').value;}
+function sliceSheet(g){ // split a scanned sprite sheet into frames at empty column gaps
+  const W=g.w||lw(),H=Math.floor(g.data.length*8/g.bpp/W),occ=new Uint8Array(W);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(pxl(g,x,y))occ[x]=1;
+  const segs=[];let x=0;
+  while(x<W){if(!occ[x]){x++;continue;}const s=x;let gap=0,e=x;while(x<W&&gap<4){if(occ[x]){e=x;gap=0;}else gap++;x++;}segs.push([s,e]);}
+  if(segs.length<2||segs.length>32)return null;
+  const fr=[];
+  for(const[a,b]of segs){let y0=H,y1=-1;for(let y=0;y<H;y++)for(let xx=a;xx<=b;xx++)if(pxl(g,xx,y)){if(y<y0)y0=y;if(y>y1)y1=y;}if(y1>=0)fr.push({x:a,y:y0,w:b-a+1,h:y1-y0+1});}
+  return fr.length>1?fr:null;
+}
+function cropImg(e){ // one sliced frame on a shared canvas, aligned + manual pixel shift
+  const al=$('al').checked,key='k'+S.crops.indexOf(e.crop)+':'+S.bank+':'+e.dx+','+e.dy+':'+al;
+  if(S.fc.has(key))return S.fc.get(key);
+  const mw=Math.max(...S.crops.map(c=>c.w)),mh=Math.max(...S.crops.map(c=>c.h)),minY=Math.min(...S.crops.map(c=>c.y)),maxB=Math.max(...S.crops.map(c=>c.y+c.h));
+  const c=document.createElement('canvas');c.width=mw+32;c.height=(al?mh:maxB-minY)+32;
+  const x=c.getContext('2d');x.imageSmoothingEnabled=false;
+  const cx=((c.width-e.crop.w)>>1)+e.dx,cy=(al?c.height-16-e.crop.h:16+e.crop.y-minY)+e.dy;
+  x.drawImage(frameCanvas(-1),e.crop.x,e.crop.y,e.crop.w,e.crop.h,cx,cy,e.crop.w,e.crop.h);
+  S.fc.set(key,c);return c;
+}
 function pxl(g,x,y){ // scanned (non-tiled) graphics, lw() pixels wide
   const W=g.w||lw(),i=y*W+x;
   if(g.bpp===8)return g.data[i]||0;
@@ -574,6 +601,7 @@ function px(g,o,y,x){ // pixel value inside a tile at byte offset o
   const b=g.data[o+y*8+x];return b===undefined?0:b;
 }
 function bounds(){
+  if(S.crops&&!S.cells){const f=frameImg(S.list[0]);return{x:0,y:0,w:f.width,h:f.height};}
   if(!S.cells){let w=1,h=1;for(const e of S.list){const f=frameCanvas(e.cell,e.gi);w=Math.max(w,f.width);h=Math.max(h,f.height);}return{x:0,y:0,w,h};}
   let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
   for(const e of S.list){const t=tf(e),cs=Math.cos(t.rot),sn=Math.sin(t.rot);
@@ -587,11 +615,12 @@ function bounds(){
 function clearCv(){const cv=$('cv');cv.width=cv.height=1;}
 function showFrame(){
   if(!S.gfx||!S.pal)return;
-  const e=S.list[S.fi],c=frameImg(e),z=+$('zoom').value,cv=$('cv'),b=S.cells?bounds():{x:0,y:0,w:c.width,h:c.height};
+  const e=S.list[S.fi];if(e.crop){$('sx').value=e.dx;$('sy').value=e.dy;}
+  const c=frameImg(e),z=+$('zoom').value,cv=$('cv'),b=S.cells?bounds():{x:0,y:0,w:c.width,h:c.height};
   cv.width=b.w*z;cv.height=b.h*z;const ctx=cv.getContext('2d');ctx.imageSmoothingEnabled=false;
   ctx.drawImage(c,b.x,b.y,b.w,b.h,0,0,cv.width,cv.height);
   $('scrub').value=S.fi;
-  $('meta').innerHTML=[['Frame',(S.fi+1)+' / '+S.list.length],['Cell',e.cell<0?'sheet':e.cell],['Duration',e.dur+' ticks ('+(e.dur/60*1000|0)+' ms)'],['Shift',e.tx!==undefined&&$('shift').checked?`x ${e.tx}, y ${e.ty}`+(e.sx!==1||e.sy!==1||e.rot?' +SRT':''):'none'],['Size',b.w+'×'+b.h],['Palette',(S.pal.cols.length)+' colours · '+S.gfx.bpp+'bpp']].map(([l,v])=>`<div class="metric"><div>${l}</div><div>${esc(v)}</div></div>`).join('');
+  $('meta').innerHTML=[['Frame',(S.fi+1)+' / '+S.list.length],['Cell',e.cell<0?'sheet':e.cell],['Duration',e.dur+' ticks ('+(e.dur/60*1000|0)+' ms)'],['Shift',e.crop?`x ${e.dx}, y ${e.dy}`:e.tx!==undefined&&$('shift').checked?`x ${e.tx}, y ${e.ty}`+(e.sx!==1||e.sy!==1||e.rot?' +SRT':''):'none'],['Size',b.w+'×'+b.h],['Palette',(S.pal.cols.length)+' colours · '+S.gfx.bpp+'bpp']].map(([l,v])=>`<div class="metric"><div>${l}</div><div>${esc(v)}</div></div>`).join('');
 }
 function tick(ts){
   requestAnimationFrame(tick);
@@ -690,7 +719,7 @@ async function makeWebp(cvs,ticks){
 function outCanvas(e,bg){ // 256x192 window centred on the sprite origin, like a DS screen
   const c=document.createElement('canvas');c.width=256;c.height=192;const x=c.getContext('2d');x.imageSmoothingEnabled=false;
   if(bg){x.fillStyle=bg;x.fillRect(0,0,256,192);}
-  const f=frameImg(e);if(S.cells)x.drawImage(f,0,32,256,192,0,0,256,192);else x.drawImage(f,0,0);
+  const f=frameImg(e);if(S.cells)x.drawImage(f,0,32,256,192,0,0,256,192);else if(S.crops)x.drawImage(f,(256-f.width)>>1,(192-f.height)>>1);else x.drawImage(f,0,0);
   return c;
 }
 async function exportAnim(){
@@ -724,6 +753,9 @@ $('hp').onclick=()=>{hexOff=Math.max(0,hexOff-512);drawHex();};
 $('hn').onclick=()=>{if(hexData&&hexOff+512<hexData.length){hexOff+=512;drawHex();}};
 ['ps','gs','cs','as','ns'].forEach(id=>$(id).onchange=()=>{if(id==='ps')$('ap').checked=false;loadSprite();});
 $('rb').onchange=()=>{if(S.c)loadSprite();};
+$('sx').oninput=$('sy').oninput=()=>{const e=S.list[S.fi];if(e&&e.crop){e.dx=+$('sx').value||0;e.dy=+$('sy').value||0;S.fc.clear();showFrame();}};
+$('al').onchange=()=>{S.fc.clear();if(S.gfx)showFrame();};
+$('sl').onchange=()=>{if(S.c)loadSprite();};
 $('grp').onchange=()=>{if(S.c)loadSprite();};
 $('fd').onchange=()=>{if(S.gseq)buildList(0);};
 $('sw').onchange=()=>{S.fc.clear();if(S.gfx)showFrame();};
