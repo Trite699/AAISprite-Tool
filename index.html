@@ -93,9 +93,9 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     <label>Animation<select class="sel" id="as"></select></label>
     <label>Screen map (NSCR)<select class="sel" id="ns"></select></label>
     <label>Raw graphics depth<select class="sel" id="rb"><option value="4">4bpp</option><option value="8">8bpp</option></select></label>
-    <label>Raw layout<select class="sel" id="rl"><option value="0">Tiled 8×8</option><option value="1">Scanned (bitmap)</option></select></label>
+    <label>Raw layout<select class="sel" id="rl"><option value="auto" selected>Auto (best guess)</option><option value="0">Tiled 8×8</option><option value="1">Scanned (bitmap)</option></select></label>
     <label>Tiles per row (tiled)<select class="sel" id="tw"><option>4</option><option>8</option><option>16</option><option selected>32</option><option>64</option></select></label>
-    <label>Scanned gfx width<select class="sel" id="sw"><option>256</option><option selected>128</option><option>64</option><option>32</option></select></label>
+    <label>Scanned gfx width<select class="sel" id="sw"><option>512</option><option>256</option><option selected>128</option><option>64</option><option>32</option></select></label>
     <label class="chk"><input type="checkbox" id="allf"> List every file</label>
   </div>
   <div class="opts" style="margin-top:0">
@@ -319,8 +319,19 @@ function parsePal(d){
   for(let i=0;i<sz/2;i++){const v=dv.getUint16(p+0x18+i*2,true);cols.push([(v&31)*255/31|0,(v>>5&31)*255/31|0,(v>>10&31)*255/31|0]);}
   return{cols,bpp:dv.getUint32(p+8,true)===4?8:4};
 }
+function guessRaw(d,bpp){ // pick scanned width vs tiled by how similar neighbouring pixel rows are
+  const tb=bpp===4?32:64,pix=i=>bpp===4?((d[i>>1]>>(i&1?4:0))&15):d[i]||0;
+  const score=(get,W,H)=>{let s=0,n=0;for(let y=0;y<H-1&&y<400;y++)for(let x=0;x<W;x++){s+=Math.abs(get(x,y)-get(x,y+1));n++;}return n?s/n:1e9;};
+  let best={lin:true,w:128,s:1e9};
+  for(const W of[256,128,64,32,512]){const H=Math.floor(d.length*8/bpp/W);if(H<8)continue;const s=score((x,y)=>pix(y*W+x),W,H);if(s<best.s*0.97)best={lin:true,w:W,s};}
+  const th=Math.floor(d.length/tb/32)*8;
+  if(th>=8){const s=score((x,y)=>{const t=(y>>3)*32+(x>>3),o=t*tb+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),v=d[o]||0;return bpp===4?((x&1)?v>>4:v&15):v;},256,th);if(s<best.s*0.8)best={lin:false,w:0,s};}
+  return best;
+}
 function parseGfx(d){
-  if(str(d,0,4)!=='RGCN'){const bpp=+$('rb').value;return{bpp,data:d,tw:0,th:0,lin:$('rl').value==='1',tb:bpp===4?32:64};}
+  if(str(d,0,4)!=='RGCN'){const bpp=+$('rb').value;let lin=$('rl').value==='1';
+    if($('rl').value==='auto'){const g=guessRaw(d,bpp);lin=g.lin;if(g.lin)$('sw').value=g.w;}
+    return{bpp,data:d,tw:0,th:0,lin,tb:bpp===4?32:64};}
   const{dv,m}=blocks(d),p=m.RAHC;if(p===undefined)throw new Error('Not a graphics file');
   const bpp=dv.getUint32(p+0xc,true)===4?8:4,sz=Math.min(dv.getUint32(p+0x18,true),d.length-p-0x20);
   return{bpp,data:d.subarray(p+0x20,p+0x20+sz),tw:dv.getUint16(p+0xa,true),th:dv.getUint16(p+8,true),lin:dv.getUint32(p+0x14,true)===1,tb:bpp===4?32:64};
