@@ -93,6 +93,8 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     <label>Animation<select class="sel" id="as"></select></label>
     <label>Screen map (NSCR)<select class="sel" id="ns"></select></label>
     <label>Raw graphics depth<select class="sel" id="rb"><option value="4">4bpp</option><option value="8">8bpp</option></select></label>
+    <label>Raw layout<select class="sel" id="rl"><option value="0">Tiled 8×8</option><option value="1">Scanned (bitmap)</option></select></label>
+    <label>Tiles per row (tiled)<select class="sel" id="tw"><option>4</option><option>8</option><option>16</option><option selected>32</option><option>64</option></select></label>
     <label>Scanned gfx width<select class="sel" id="sw"><option>256</option><option selected>128</option><option>64</option><option>32</option></select></label>
     <label class="chk"><input type="checkbox" id="allf"> List every file</label>
   </div>
@@ -318,7 +320,7 @@ function parsePal(d){
   return{cols,bpp:dv.getUint32(p+8,true)===4?8:4};
 }
 function parseGfx(d){
-  if(str(d,0,4)!=='RGCN'){const bpp=+$('rb').value;return{bpp,data:d,tw:0,th:0,tb:bpp===4?32:64};}
+  if(str(d,0,4)!=='RGCN'){const bpp=+$('rb').value;return{bpp,data:d,tw:0,th:0,lin:$('rl').value==='1',tb:bpp===4?32:64};}
   const{dv,m}=blocks(d),p=m.RAHC;if(p===undefined)throw new Error('Not a graphics file');
   const bpp=dv.getUint32(p+0xc,true)===4?8:4,sz=Math.min(dv.getUint32(p+0x18,true),d.length-p-0x20);
   return{bpp,data:d.subarray(p+0x20,p+0x20+sz),tw:dv.getUint16(p+0xa,true),th:dv.getUint16(p+8,true),lin:dv.getUint32(p+0x14,true)===1,tb:bpp===4?32:64};
@@ -455,7 +457,7 @@ function frameCanvas(cell){
   const key=cell+':'+S.bank;if(S.fc.has(key))return S.fc.get(key);
   const g=S.gfx,cols=S.pal.cols;let c;
   if(cell===-2){c=drawScr();}else if(cell<0&&g.lin){c=linSheet();}else if(cell<0){ // tile sheet
-    const W=32,n=Math.max(1,g.data.length/g.tb|0),H=Math.ceil(n/W);
+    const W=Math.max(1,+$('tw').value||32),n=Math.max(1,g.data.length/g.tb|0),H=Math.ceil(n/W);
     c=document.createElement('canvas');c.width=W*8;c.height=H*8;
     const ctx=c.getContext('2d'),im=ctx.createImageData(c.width,c.height),bk=Math.max(S.bank,0);
     for(let t=0;t<n;t++)for(let y=0;y<8;y++)for(let x=0;x<8;x++){
@@ -665,6 +667,7 @@ $('hn').onclick=()=>{if(hexData&&hexOff+512<hexData.length){hexOff+=512;drawHex(
 ['ps','gs','cs','as','ns'].forEach(id=>$(id).onchange=()=>loadSprite());
 $('rb').onchange=()=>{if(S.c)loadSprite();};
 $('sw').onchange=()=>{S.fc.clear();if(S.gfx)showFrame();};
+['rl','tw'].forEach(id=>$(id).onchange=()=>{if(S.c)loadSprite();});
 $('allf').onchange=()=>{if(S.c){fillSel(S.c,true);loadSprite();}};
 function fname(e,t){return e.name.split('/').pop();}
 $('pb').onchange=()=>{S.bank=+$('pb').value;S.fc.clear();showFrame();};
