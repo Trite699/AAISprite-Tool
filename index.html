@@ -97,7 +97,8 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     <label>Tiles per row (tiled)<select class="sel" id="tw"><option>4</option><option>8</option><option>16</option><option selected>32</option><option>64</option></select></label>
     <label>Scanned gfx width<select class="sel" id="sw"><option>512</option><option>256</option><option selected>128</option><option>64</option><option>32</option></select></label>
     <label class="chk"><input type="checkbox" id="allf"> List every file</label>
-    <label class="chk"><input type="checkbox" id="grp" checked> Auto-group frames (images after one palette)</label>
+    <label class="chk"><input type="checkbox" id="ap" checked> Auto-pick palette</label>
+    <label class="chk"><input type="checkbox" id="grp" checked> Auto-group frames (3+ consecutive same-size images)</label>
     <label>Frame delay<select class="sel" id="fd"><option value="3">3 ticks</option><option value="6" selected>6 ticks</option><option value="12">12 ticks</option><option value="30">30 ticks</option></select></label>
   </div>
   <div class="opts" style="margin-top:0">
@@ -233,7 +234,9 @@ function tagOf(c,e){
   const m=d.length>=4?str(d,0,4):'';let tag=MAGIC[m]||'';
   if(e.auto){if(!r.length)tag='NULL';else if(!tag)tag=size===32?'PAL4':size===512?'PAL8':size%32===0?'IMG':'UNK';}
   if(e.auto&&(tag==='IMG'||tag==='UNK')&&d.length>=4){const T0=dvOf(d).getUint32(0,true);if(T0>=8&&T0<=4096&&T0<size){const full=z?(lz(r)||{}).data:r;if(full&&parseArc(full))tag='ARC';}}
-  const t={tag,lz:!!z,size};c.tags.set(e,t);
+  let pal=false;
+  if(e.auto&&size>=32&&size<=512&&size%32===0&&(tag==='PAL4'||tag==='PAL8'||tag==='IMG')){const fd=z?(lz(r)||{}).data:r;if(fd){pal=true;const v=dvOf(fd);for(let i=0;i<fd.length-1&&pal;i+=2)if(v.getUint16(i,true)&0x8000)pal=false;}}
+  const t={tag,lz:!!z,size,pal};c.tags.set(e,t);
   if(e.auto&&!e.named){e.named=1;e.name=String(e.idx).padStart(4,'0')+'-'+hx(e.off,8).toLowerCase()+EXT[tag];}
   return t;
 }
@@ -325,9 +328,9 @@ function guessRaw(d,bpp){ // pick scanned width vs tiled by how similar neighbou
   const tb=bpp===4?32:64,pix=i=>bpp===4?((d[i>>1]>>(i&1?4:0))&15):d[i]||0;
   const score=(get,W,H)=>{let s=0,n=0;for(let y=0;y<H-1&&y<400;y++)for(let x=0;x<W;x++){s+=Math.abs(get(x,y)-get(x,y+1));n++;}return n?s/n:1e9;};
   let best={lin:true,w:128,s:1e9};
-  for(const W of[256,128,64,32,512]){const H=Math.floor(d.length*8/bpp/W);if(H<8)continue;const s=score((x,y)=>pix(y*W+x),W,H);if(s<best.s*0.97)best={lin:true,w:W,s};}
+  for(const W of[256,128,64,32,512]){const H=Math.floor(d.length*8/bpp/W);if(H<8)continue;const s=score((x,y)=>pix(y*W+x),W,H);if(s<best.s)best={lin:true,w:W,s};}
   const th=Math.floor(d.length/tb/32)*8;
-  if(th>=8){const s=score((x,y)=>{const t=(y>>3)*32+(x>>3),o=t*tb+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),v=d[o]||0;return bpp===4?((x&1)?v>>4:v&15):v;},256,th);if(s<best.s*0.8)best={lin:false,w:0,s};}
+  if(th>=8){const s=score((x,y)=>{const t=(y>>3)*32+(x>>3),o=t*tb+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),v=d[o]||0;return bpp===4?((x&1)?v>>4:v&15):v;},256,th);if(s<best.s)best={lin:false,w:0,s};}
   return best;
 }
 function parseGfx(d){
@@ -402,22 +405,53 @@ function fillSel(c,keep){
   S.c=c;const all=$('allf').checked,ok={ps:['NCLR','PAL4','PAL8'],gs:['NCGR','IMG'],cs:['NCER'],as:['NANR'],ns:['NSCR']},ph={ps:'— choose palette —',gs:'— choose graphics —',cs:'— none (tile sheet) —',as:'— none (play cells) —',ns:'— none —'};
   for(const id in ok){
     const prev=keep?$(id).value:'',ks=[];
-    c.ents.forEach((e,k)=>{if(all||ok[id].includes(tagOf(c,e).tag))ks.push(k);});
+    c.ents.forEach((e,k)=>{const t=tagOf(c,e);if(all||ok[id].includes(t.tag)||(id==='ps'&&t.pal))ks.push(k);});
     $(id).innerHTML=`<option value="-1">${ph[id]}</option>`+ks.map(k=>`<option value="${k}">${esc(c.ents[k].name)}</option>`).join('');
     if([...$(id).options].some(o=>o.value===prev))$(id).value=prev;
   }
 }
 function nearestTag(c,i,tags){let b=-1,bs=1e9;c.ents.forEach((e,k)=>{if(!tags.includes(tagOf(c,e).tag))return;const s=k<=i?i-k:1000+k-i;if(s<bs){bs=s;b=k;}});return b;}
+function palScore(d,bpp,L,cols,bank){ // how smooth the picture looks with this palette: mean colour jump between neighbouring pixels
+  const W=L.lin?L.w:256,H=Math.floor(d.length*8/bpp/W);if(H<1)return 1e9;
+  const get=(x,y)=>{let v;
+    if(L.lin){const i=y*W+x;v=bpp===4?(d[i>>1]>>(i&1?4:0))&15:d[i];}
+    else{const t=(y>>3)*32+(x>>3),o=t*(bpp===4?32:64)+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),b=d[o]||0;v=bpp===4?((x&1)?b>>4:b&15):b;}
+    return v||0;};
+  let s=0,n=0;const step=Math.max(1,Math.floor(H/48));
+  for(let y=0;y<H;y+=step)for(let x=0;x<W-1;x++){
+    const a=get(x,y),b=get(x+1,y);if(a===b)continue;
+    const ca=cols[bpp===4?bank*16+a:a],cb=cols[bpp===4?bank*16+b:b];
+    s+=(!ca||!cb)?765:Math.abs(ca[0]-cb[0])+Math.abs(ca[1]-cb[1])+Math.abs(ca[2]-cb[2]);n++;
+  }
+  return n>40?s/n:1e9;
+}
+function autoPal(c,gi){ // try every palette-looking file within 16 entries (and every 16-colour bank) and keep the smoothest
+  const d=getData(c,c.ents[gi]),rb=$('rb').value,cands=[];
+  for(let k=Math.max(0,gi-16);k<=Math.min(c.ents.length-1,gi+16);k++){
+    const t=tagOf(c,c.ents[k]);if(k===gi||!(t.tag==='NCLR'||t.tag==='PAL4'||t.tag==='PAL8'||t.pal))continue;
+    try{const p=parsePal(getData(c,c.ents[k]));if(new Set(p.cols.map(x=>x.join())).size>=3)cands.push({k,p});}catch(_){}
+  }
+  const lay={};let best=null;
+  for(const cd of cands){
+    const n=cd.p.cols.length,bpp=rb==='auto'?(n>=256?8:4):+rb;
+    if(bpp===8&&n<256)continue;
+    const L=lay[bpp]||(lay[bpp]=$('rl').value==='auto'?guessRaw(d,bpp):{lin:$('rl').value==='1',w:+$('sw').value});
+    const nb=bpp===4?Math.floor(n/16):1;
+    for(let b=0;b<nb;b++){const s=palScore(d,bpp,L,cd.p.cols,b);if(s<(best?best.s:1e9))best={k:cd.k,bank:bpp===4?b:-1,s};}
+  }
+  return best;
+}
 function useAs(id,i){
   const c=cur();if(S.c!==c)fillSel(c,false);
   if(![...$(id).options].some(o=>+o.value===i)){$('allf').checked=true;fillSel(c,true);}
-  $(id).value=i;showTab(2);loadSprite();
+  $(id).value=i;if(id==='ps')$('ap').checked=false;showTab(2);loadSprite();
 }
 function openSprite(c,i){
   fillSel(c,S.c===c);const t=tagOf(c,c.ents[i]).tag;
   const want={ps:['NCLR','PAL4','PAL8'],gs:['NCGR','IMG'],cs:['NCER'],ns:['NSCR']};
   for(const id in want){if(want[id].includes(t))$(id).value=i;else if(+$(id).value<0){const k=nearestTag(c,i,want[id]);if(k>=0)$(id).value=k;}}
   if(t==='NANR')$('as').value=i;
+  if(t==='IMG')$('ap').checked=true;else if(['PAL4','PAL8','NCLR'].includes(t))$('ap').checked=false;
   showTab(2);loadSprite();
 }
 function openSpriteOld(c,i){
@@ -435,6 +469,8 @@ function openSpriteOld(c,i){
 function ent(id){const k=+$(id).value;return k<0||isNaN(k)?null:S.c.ents[k];}
 function loadSprite(resetBank){
   try{
+    let autoBank=null;
+    if($('ap').checked&&ent('gs')&&!ent('cs')&&str(getData(S.c,ent('gs')),0,4)!=='RGCN'){const r=autoPal(S.c,+$('gs').value);if(r){$('ps').value=r.k;autoBank=r.bank;}}
     const pe=ent('ps'),ge=ent('gs'),ce=ent('cs'),ae=ent('as');
     S.pal=pe?parsePal(getData(S.c,pe)):null;S.gfx=ge?parseGfx(getData(S.c,ge)):null;
     S.cells=ce?parseCells(getData(S.c,ce)):null;S.anim=ae?parseAnim(getData(S.c,ae)):null;S.scr=ent('ns')?parseScr(getData(S.c,ent('ns'))):null;
@@ -442,15 +478,14 @@ function loadSprite(resetBank){
     S.gseq=null;S.gstart=0;
     if(S.gfx&&!S.cells&&!S.scr&&$('grp').checked&&str(getData(S.c,ge),0,4)!=='RGCN'){
       // AAI1: a palette is followed by the images that use it — treat them as animation frames
-      const c=S.c,gi=+$('gs').value,isP=t=>t==='PAL4'||t==='PAL8'||t==='NCLR';let p0=-1;
-      for(let k=gi;k>=0;k--)if(isP(tagOf(c,c.ents[k]).tag)){p0=k;break;}
-      const seq=[];
-      for(let k=p0+1;k<c.ents.length;k++){const t=tagOf(c,c.ents[k]).tag;if(isP(t))break;if(t==='IMG')seq.push(k);}
-      if(seq.length>1&&seq.includes(gi)){S.gseq=seq.map(k=>parseGfx(getData(c,c.ents[k])));S.gstart=seq.indexOf(gi);}
+      const c=S.c,gi=+$('gs').value,sz=tagOf(c,c.ents[gi]).size,same=k=>{const t=tagOf(c,c.ents[k]);return t.tag==='IMG'&&t.size===sz;};
+      let a=gi,z2=gi;while(a>0&&same(a-1))a--;while(z2<c.ents.length-1&&same(z2+1))z2++;
+      const seq=[];for(let k=a;k<=z2;k++)seq.push(k);
+      if(sz>=2048&&seq.length>=3){S.gseq=seq.map(k=>parseGfx(getData(c,c.ents[k])));S.gstart=seq.indexOf(gi);}
     }
     const nb=Math.max(1,Math.ceil(S.pal.cols.length/16));
     sel('pb','<option value="-1">Auto (per OAM)</option>'+Array.from({length:nb},(_,i)=>`<option value="${i}">Bank ${i}</option>`).join(''));
-    S.bank=-1;S.fc.clear();
+    S.bank=-1;if(autoBank!==null&&autoBank>=0){$('pb').value=autoBank;S.bank=autoBank;}S.fc.clear();
     if(S.anim){$('as').dataset.n=S.anim.seqs.length;}
     buildAnimSel();
     $('xmsg').innerHTML='';
@@ -687,7 +722,7 @@ $('t1').onclick=()=>showTab(1);$('t2').onclick=()=>{if(S.c)showTab(2);else{showT
 $('flt').oninput=renderList;$('onlyspr').onchange=renderList;
 $('hp').onclick=()=>{hexOff=Math.max(0,hexOff-512);drawHex();};
 $('hn').onclick=()=>{if(hexData&&hexOff+512<hexData.length){hexOff+=512;drawHex();}};
-['ps','gs','cs','as','ns'].forEach(id=>$(id).onchange=()=>loadSprite());
+['ps','gs','cs','as','ns'].forEach(id=>$(id).onchange=()=>{if(id==='ps')$('ap').checked=false;loadSprite();});
 $('rb').onchange=()=>{if(S.c)loadSprite();};
 $('grp').onchange=()=>{if(S.c)loadSprite();};
 $('fd').onchange=()=>{if(S.gseq)buildList(0);};
