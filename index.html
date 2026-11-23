@@ -94,11 +94,12 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     <label>Screen map (NSCR)<select class="sel" id="ns"></select></label>
     <label>Raw graphics depth<select class="sel" id="rb"><option value="auto" selected>Auto (from palette)</option><option value="4">4bpp</option><option value="8">8bpp</option></select></label>
     <label>Raw layout<select class="sel" id="rl"><option value="auto" selected>Auto (best guess)</option><option value="0">Tiled 8×8</option><option value="1">Scanned (bitmap)</option></select></label>
-    <label>Tiles per row (tiled)<select class="sel" id="tw"><option>4</option><option>8</option><option>16</option><option selected>32</option><option>64</option></select></label>
+    <label>Tiles per row (tiled)<select class="sel" id="tw"><option value="auto" selected>Auto</option><option>2</option><option>4</option><option>8</option><option>12</option><option>16</option><option>24</option><option>32</option><option>64</option></select></label>
+    <label>Tile block (tiled)<select class="sel" id="tb"><option value="auto" selected>Auto</option><option value="1x1">1×1 (plain rows)</option><option value="2x2">2×2 (16×16)</option><option value="4x4">4×4 (32×32)</option><option value="8x8">8×8 (64×64)</option><option value="4x2">4×2 (32×16)</option><option value="2x4">2×4 (16×32)</option><option value="8x4">8×4 (64×32)</option><option value="4x8">4×8 (32×64)</option></select></label>
     <label>Scanned gfx width<select class="sel" id="sw"><option>512</option><option>256</option><option selected>128</option><option>64</option><option>32</option></select></label>
     <label class="chk"><input type="checkbox" id="allf"> List every file</label>
     <label class="chk"><input type="checkbox" id="ap" checked> Auto-pick palette</label>
-    <label class="chk"><input type="checkbox" id="grp" checked> Auto-group frames (3+ consecutive same-size images)</label>
+    <label class="chk"><input type="checkbox" id="grp"> Treat consecutive same-size images as animation frames (off = one sheet)</label>
     <label>Frame delay<select class="sel" id="fd"><option value="3">3 ticks</option><option value="6" selected>6 ticks</option><option value="12">12 ticks</option><option value="30">30 ticks</option></select></label>
     <label class="chk"><input type="checkbox" id="sl" checked> Slice sprite sheet into frames</label>
     <label class="chk"><input type="checkbox" id="al" checked> Align frames (bottom-centre)</label>
@@ -120,7 +121,7 @@ input[type=range]{width:100%;accent-color:var(--accent);}
   <label style="font-size:11.5px;color:var(--text-secondary);display:flex;gap:6px;align-items:center">Format <select class="sel" id="xfmt"><option value="gif">GIF</option><option value="apng">APNG</option><option value="webp">WebP</option></select> Background <select class="sel" id="xbg"><option value="">Transparent</option><option value="#000000">Black</option><option value="#ffffff">White</option><option value="#00b140">Green</option></select></label>
   <button class="btn btn-primary btn-sm" id="dlg">Export animation (256×192)</button></div>
   <div id="xmsg"></div>
-  <p class="foot" style="margin-top:8px">Durations are in 1/60 s ticks. Pixel shifts come from the animation's per-frame translate data (plus rotation/scale when present); untick “Apply pixel shifts” to compare. Per-OAM rotation/scale is not applied. If sprites look wrong, try another palette bank or graphics file from the same archive.</p>
+  <p class="foot" style="margin-top:8px">Durations are in 1/60 s ticks. Pixel shifts come from the animation's per-frame translate data (plus rotation/scale when present); untick “Apply pixel shifts” to compare. Per-OAM rotation/scale is not applied. If sprites look wrong, try another palette bank or graphics file from the same archive. For raw sheets that look like scrambled chunks, set Raw layout to “Tiled 8×8” and try different Tiles per row / Tile block values.</p>
 </div></div>
 </div>
 
@@ -328,19 +329,53 @@ function parsePal(d){
   for(let i=0;i<sz/2;i++){const v=dv.getUint16(p+0x18+i*2,true);cols.push([(v&31)*255/31|0,(v>>5&31)*255/31|0,(v>>10&31)*255/31|0]);}
   return{cols,bpp:dv.getUint32(p+8,true)===4?8:4};
 }
-function guessRaw(d,bpp){ // pick scanned width vs tiled by how similar neighbouring pixel rows are
-  const tb=bpp===4?32:64,pix=i=>bpp===4?((d[i>>1]>>(i&1?4:0))&15):d[i]||0;
-  const score=(get,W,H)=>{let s=0,n=0;for(let y=0;y<H-1&&y<400;y++)for(let x=0;x<W;x++){s+=Math.abs(get(x,y)-get(x,y+1));n++;}return n?s/n:1e9;};
-  let best={lin:true,w:128,s:1e9};
-  for(const W of[256,128,64,32,512]){const H=Math.floor(d.length*8/bpp/W);if(H<8)continue;const s=score((x,y)=>pix(y*W+x),W,H);if(s<best.s)best={lin:true,w:W,s};}
-  const th=Math.floor(d.length/tb/32)*8;
-  if(th>=8){const s=score((x,y)=>{const t=(y>>3)*32+(x>>3),o=t*tb+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),v=d[o]||0;return bpp===4?((x&1)?v>>4:v&15):v;},256,th);if(s<best.s)best={lin:false,w:0,s};}
-  return best;
+
+// ---------- raw graphics layouts ----------
+// A layout L is either {lin:true,w} (scanned bitmap) or {lin:false,tpr,bw,bh}:
+// 8x8 tiles, tpr tiles per row, and tiles grouped in bw x bh blocks (like a 1D-mapped OBJ: each block is
+// stored tile-by-tile, row-major inside the block, and blocks follow each other left-to-right, top-to-bottom).
+function layoutDims(d,bpp,L){const W=L.lin?L.w:L.tpr*8;return{W,H:Math.floor(d.length*8/bpp/W)};}
+function tileIndex(L,tx,ty){ // which stored tile ends up at grid position (tx,ty)
+  const bw=L.bw||1,bh=L.bh||1,bpr=(L.tpr/bw)|0;
+  return (((ty/bh|0)*bpr+(tx/bw|0))*bw*bh+(ty%bh)*bw+(tx%bw));
+}
+function layoutGet(d,bpp,L){
+  if(L.lin)return(x,y)=>{const i=y*L.w+x;return bpp===4?((d[i>>1]|0)>>(i&1?4:0))&15:d[i]|0;};
+  const tb=bpp===4?32:64;
+  return(x,y)=>{
+    const t=tileIndex(L,x>>3,y>>3),o=t*tb+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),v=d[o]|0;
+    return bpp===4?((x&1)?v>>4:v&15):v;
+  };
+}
+function guessRaw(d,bpp,opt){ // pick the layout (scanned width / tiles-per-row / block shape) whose picture is the smoothest
+  opt=opt||{};const cands=[];
+  if(!opt.tiled)for(const W of[256,128,64,32,512])cands.push({lin:true,w:W,pen:1});
+  const tprs=opt.tpr?[opt.tpr]:[16,32,8,4,64,12,24,2],blks=opt.blk?[opt.blk]:[[1,1],[2,2],[4,4],[8,8],[4,2],[2,4],[8,4],[4,8]];
+  for(const tpr of tprs)for(const[bw,bh]of blks){if(tpr%bw)continue;cands.push({lin:false,tpr,bw,bh,pen:bw*bh>1?1.03:1});}
+  let best=null;
+  for(const L of cands){
+    const{W,H}=layoutDims(d,bpp,L);if(H<8)continue;
+    const get=layoutGet(d,bpp,L),Y=Math.min(H-1,240);let s=0,n=0;
+    for(let y=0;y<Y;y+=2)for(let x=0;x<W-1;x++){const v=get(x,y);s+=Math.abs(v-get(x,y+1))+Math.abs(v-get(x+1,y));n+=2;}
+    const sc=(n?s/n:1e9)*L.pen;
+    if(!best||sc<best.sc)best={L,sc};
+  }
+  return best?best.L:(opt.tiled?{lin:false,tpr:opt.tpr||16,bw:1,bh:1}:{lin:true,w:128});
+}
+function resolveLayout(d,bpp){ // combine the Raw layout / Tiles per row / Tile block controls
+  const rl=$('rl').value,tw=$('tw').value,tbk=$('tb').value;
+  if(rl==='1')return{lin:true,w:+$('sw').value};
+  const opt={tiled:rl==='0'||tw!=='auto'||tbk!=='auto'};
+  if(tw!=='auto')opt.tpr=+tw;
+  if(tbk!=='auto')opt.blk=tbk.split('x').map(Number);
+  return guessRaw(d,bpp,opt);
 }
 function parseGfx(d){
-  if(str(d,0,4)!=='RGCN'){const bpp=$('rb').value==='auto'?(S.pal&&S.pal.cols.length>=256?8:4):+$('rb').value;let lin=$('rl').value==='1',w=+$('sw').value;
-    if($('rl').value==='auto'){const g=guessRaw(d,bpp);lin=g.lin;if(g.lin)w=g.w;}
-    return{bpp,data:d,tw:0,th:0,lin,w,tb:bpp===4?32:64};}
+  if(str(d,0,4)!=='RGCN'){
+    const bpp=$('rb').value==='auto'?(S.pal&&S.pal.cols.length>=256?8:4):+$('rb').value,tb=bpp===4?32:64,L=resolveLayout(d,bpp);
+    if(L.lin)return{bpp,data:d,tw:0,th:0,lin:true,w:L.w,tb};
+    return{bpp,data:d,tw:0,th:0,lin:false,til:true,tpr:L.tpr,bw:L.bw||1,bh:L.bh||1,w:L.tpr*8,tb};
+  }
   const{dv,m}=blocks(d),p=m.RAHC;if(p===undefined)throw new Error('Not a graphics file');
   const bpp=dv.getUint32(p+0xc,true)===4?8:4,sz=Math.min(dv.getUint32(p+0x18,true),d.length-p-0x20);
   return{bpp,data:d.subarray(p+0x20,p+0x20+sz),tw:dv.getUint16(p+0xa,true),th:dv.getUint16(p+8,true),lin:dv.getUint32(p+0x14,true)===1,tb:bpp===4?32:64};
@@ -416,11 +451,8 @@ function fillSel(c,keep){
 }
 function nearestTag(c,i,tags){let b=-1,bs=1e9;c.ents.forEach((e,k)=>{if(!tags.includes(tagOf(c,e).tag))return;const s=k<=i?i-k:1000+k-i;if(s<bs){bs=s;b=k;}});return b;}
 function palScore(d,bpp,L,cols,bank){ // how smooth the picture looks with this palette: mean colour jump between neighbouring pixels
-  const W=L.lin?L.w:256,H=Math.floor(d.length*8/bpp/W);if(H<1)return 1e9;
-  const get=(x,y)=>{let v;
-    if(L.lin){const i=y*W+x;v=bpp===4?(d[i>>1]>>(i&1?4:0))&15:d[i];}
-    else{const t=(y>>3)*32+(x>>3),o=t*(bpp===4?32:64)+(y&7)*(bpp===4?4:8)+(bpp===4?(x&7)>>1:(x&7)),b=d[o]||0;v=bpp===4?((x&1)?b>>4:b&15):b;}
-    return v||0;};
+  const{W,H}=layoutDims(d,bpp,L);if(H<1)return 1e9;
+  const get=layoutGet(d,bpp,L);
   let s=0,n=0;const step=Math.max(1,Math.floor(H/48));
   for(let y=0;y<H;y+=step)for(let x=0;x<W-1;x++){
     const a=get(x,y),b=get(x+1,y);if(a===b)continue;
@@ -439,7 +471,7 @@ function autoPal(c,gi){ // try every palette-looking file within 16 entries (and
   for(const cd of cands){
     const n=cd.p.cols.length,bpp=rb==='auto'?(n>=256?8:4):+rb;
     if(bpp===8&&n<256)continue;
-    const L=lay[bpp]||(lay[bpp]=$('rl').value==='auto'?guessRaw(d,bpp):{lin:$('rl').value==='1',w:+$('sw').value});
+    const L=lay[bpp]||(lay[bpp]=resolveLayout(d,bpp));
     const nb=bpp===4?Math.floor(n/16):1;
     for(let b=0;b<nb;b++){const s=palScore(d,bpp,L,cd.p.cols,b);if(s<(best?best.s:1e9))best={k:cd.k,bank:bpp===4?b:-1,s};}
   }
@@ -481,14 +513,14 @@ function loadSprite(resetBank){
     if(!S.pal||!S.gfx)throw new Error('Pick a palette and a graphics file above — or in the ROM browser select a file and click “Use as Palette / Graphics / Cells / Animation”.');
     S.gseq=null;S.gstart=0;
     if(S.gfx&&!S.cells&&!S.scr&&$('grp').checked&&str(getData(S.c,ge),0,4)!=='RGCN'){
-      // AAI1: a palette is followed by the images that use it — treat them as animation frames
+      // optional: a palette followed by several same-size images that are really separate animation frames
       const c=S.c,gi=+$('gs').value,sz=tagOf(c,c.ents[gi]).size,same=k=>{const t=tagOf(c,c.ents[k]);return t.tag==='IMG'&&t.size===sz;};
       let a=gi,z2=gi;while(a>0&&same(a-1))a--;while(z2<c.ents.length-1&&same(z2+1))z2++;
       const seq=[];for(let k=a;k<=z2;k++)seq.push(k);
       if(sz>=2048&&seq.length>=3){S.gseq=seq.map(k=>parseGfx(getData(c,c.ents[k])));S.gstart=seq.indexOf(gi);}
     }
     S.crops=null;
-    if(S.gfx&&!S.cells&&!S.scr&&!S.gseq&&S.gfx.lin&&$('sl').checked)S.crops=sliceSheet(S.gfx);
+    if(S.gfx&&!S.cells&&!S.scr&&!S.gseq&&(S.gfx.lin||S.gfx.til)&&$('sl').checked)S.crops=sliceSheet(S.gfx);
     const nb=Math.max(1,Math.ceil(S.pal.cols.length/16));
     sel('pb','<option value="-1">Auto (per OAM)</option>'+Array.from({length:nb},(_,i)=>`<option value="${i}">Bank ${i}</option>`).join(''));
     S.bank=-1;if(autoBank!==null&&autoBank>=0){$('pb').value=autoBank;S.bank=autoBank;}S.fc.clear();
@@ -513,14 +545,14 @@ function buildList(seq){
   if(S.gseq)S.fi=S.gstart||0;
   $('scrub').max=S.list.length-1;
   const tot=S.list.reduce((a,e)=>a+e.dur,0);
-  $('tinfo').textContent=S.cells?`${S.list.length} frames · ${(tot/60).toFixed(2)} s · ${S.cells.cells.length} cells`:`tile sheet · ${S.gfx.data.length/S.gfx.tb|0} tiles`;
+  $('tinfo').textContent=S.cells?`${S.list.length} frames · ${(tot/60).toFixed(2)} s · ${S.cells.cells.length} cells`:`tile sheet · ${S.gfx.data.length/S.gfx.tb|0} tiles`+(S.gfx.til?` · ${S.gfx.tpr} tiles/row`+(S.gfx.bw*S.gfx.bh>1?`, ${S.gfx.bw}×${S.gfx.bh} blocks`:''):'');
   showFrame();
 }
 function color(a){const b=S.bank>=0?S.bank:a;return S.pal.cols;}
 function frameCanvas(cell,gi){
   const key=cell+':'+S.bank+':'+(gi??'');if(S.fc.has(key))return S.fc.get(key);
   const g=gi!=null?S.gseq[gi]:S.gfx,cols=S.pal.cols;let c;
-  if(cell===-2){c=drawScr();}else if(cell<0&&g.lin){c=linSheet(g);}else if(cell<0){ // tile sheet
+  if(cell===-2){c=drawScr();}else if(cell<0&&(g.lin||g.til)){c=linSheet(g);}else if(cell<0){ // tile sheet
     const W=Math.max(1,+$('tw').value||32),n=Math.max(1,g.data.length/g.tb|0),H=Math.ceil(n/W);
     c=document.createElement('canvas');c.width=W*8;c.height=H*8;
     const ctx=c.getContext('2d'),im=ctx.createImageData(c.width,c.height),bk=Math.max(S.bank,0);
@@ -562,7 +594,7 @@ function frameImg(e){
   S.fc.set(key,c);return c;
 }
 function lw(){return +$('sw').value;}
-function sliceSheet(g){ // split a scanned sprite sheet into frames at empty column gaps
+function sliceSheet(g){ // split a (scanned or tiled) sprite sheet into frames at empty column gaps
   const W=g.w||lw(),H=Math.floor(g.data.length*8/g.bpp/W),occ=new Uint8Array(W);
   for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(pxl(g,x,y))occ[x]=1;
   const segs=[];let x=0;
@@ -582,7 +614,12 @@ function cropImg(e){ // one sliced frame on a shared canvas, aligned + manual pi
   x.drawImage(frameCanvas(-1),e.crop.x,e.crop.y,e.crop.w,e.crop.h,cx,cy,e.crop.w,e.crop.h);
   S.fc.set(key,c);return c;
 }
-function pxl(g,x,y){ // scanned (non-tiled) graphics, lw() pixels wide
+function pxl(g,x,y){ // sheet-style graphics: scanned (lw() / g.w pixels wide) or tiled with tiles-per-row + block layout
+  if(g.til){
+    if(x<0||x>=g.w)return 0;
+    const o=tileIndex(g,x>>3,y>>3)*g.tb;
+    return px(g,o,y&7,x&7);
+  }
   const W=g.w||lw(),i=y*W+x;
   if(g.bpp===8)return g.data[i]||0;
   const b=g.data[i>>1];return b===undefined?0:(i&1?b>>4:b&15);
@@ -758,8 +795,8 @@ $('al').onchange=()=>{S.fc.clear();if(S.gfx)showFrame();};
 $('sl').onchange=()=>{if(S.c)loadSprite();};
 $('grp').onchange=()=>{if(S.c)loadSprite();};
 $('fd').onchange=()=>{if(S.gseq)buildList(0);};
-$('sw').onchange=()=>{S.fc.clear();if(S.gfx)showFrame();};
-['rl','tw'].forEach(id=>$(id).onchange=()=>{if(S.c)loadSprite();});
+$('sw').onchange=()=>{if(S.c)loadSprite();};
+['rl','tw','tb'].forEach(id=>$(id).onchange=()=>{if(S.c)loadSprite();});
 $('allf').onchange=()=>{if(S.c){fillSel(S.c,true);loadSprite();}};
 function fname(e,t){return e.name.split('/').pop();}
 $('pb').onchange=()=>{S.bank=+$('pb').value;S.fc.clear();showFrame();};
